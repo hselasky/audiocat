@@ -26,8 +26,6 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <ctype.h>
-#include <sys/endian.h>
-#include <sys/soundcard.h>
 #include <pthread.h>
 #include <signal.h>
 #include <sysexits.h>
@@ -38,27 +36,27 @@
 #include <sys/param.h>
 #include <unistd.h>
 #include <err.h>
+#include <time.h>
 
 struct data;
-typedef TAILQ_HEAD(,data) head_t;
+typedef TAILQ_HEAD(, data) head_t;
 struct data {
 	TAILQ_ENTRY(data) entry;
-	int fd;
-	int bytes;
-	uint8_t data[0];
+	int	fd;
+	int	bytes;
+	uint8_t	data[0];
 };
 
 static head_t data_head = TAILQ_HEAD_INITIALIZER(data_head);
 
 struct devinfo;
-typedef TAILQ_HEAD(,devinfo) devhead_t;
+typedef TAILQ_HEAD(, devinfo) devhead_t;
 struct devinfo {
-  	TAILQ_ENTRY(devinfo) entry;
-	char inputfn[MAXPATHLEN];
-	char outputfn[MAXPATHLEN];
-	int input_fd;
-	int output_fd;
-	int stop;
+	TAILQ_ENTRY(devinfo) entry;
+	char	inputfn[MAXPATHLEN];
+	char	outputfn[MAXPATHLEN];
+	int	input_fd;
+	int	output_fd;
 };
 
 static devhead_t devinfo_head = TAILQ_HEAD_INITIALIZER(devinfo_head);
@@ -68,6 +66,7 @@ static pthread_cond_t atomic_cv;
 static int default_blocksize = 4096;	/* bytes */
 static const char *default_prefix = "recording";
 static int pending;
+static uint64_t total;
 
 static void
 atomic_lock(void)
@@ -97,6 +96,7 @@ static int
 write_async(int fd, const void *data, int bytes)
 {
 	struct data *ptr;
+
 	ptr = malloc(sizeof(*ptr) + bytes);
 	if (ptr == NULL)
 		errx(EX_SOFTWARE, "Out of memory");
@@ -109,7 +109,7 @@ write_async(int fd, const void *data, int bytes)
 	TAILQ_INSERT_TAIL(&data_head, ptr, entry);
 	atomic_signal();
 	atomic_unlock();
-	
+
 	return (bytes);
 }
 
@@ -122,23 +122,47 @@ audio_thread(void *arg)
 	int i;
 
 	while (1) {
-	  atomic_lock();
-	  if (di->stop) {
-		atomic_unlock();
-		break;
-	  }
-	  atomic_unlock();
+		error = read(di->input_fd, buffer, sizeof(buffer));
+		if (error != sizeof(buffer))
+			err(EX_SOFTWARE, "Could not read from audio file");
 
-	  error = read(di->input_fd, buffer, sizeof(buffer));
-	  if (error != sizeof(buffer))
-		errx(EX_SOFTWARE, "Could not read from audio file");
-
-	  error = write_async(di->output_fd, buffer, sizeof(buffer));
-	  if (error != sizeof(buffer))
-		errx(EX_SOFTWARE, "Could not write to audio file");
+		error = write_async(di->output_fd, buffer, sizeof(buffer));
+		if (error != sizeof(buffer))
+			err(EX_SOFTWARE, "Could not write to audio file");
 	}
 	return (NULL);
 }
+
+static void *
+status_thread(void *arg)
+{
+	time_t start = time(NULL);
+
+	while (1) {
+		uint64_t runtime;
+		uint64_t tot;
+		int pnd;
+
+		atomic_lock();
+		tot = total;
+		pnd = pending;
+		atomic_unlock();
+
+		runtime = difftime(time(NULL), start);
+		if (runtime == 0)
+			runtime = 1;
+
+		printf("Status: %09d / %09d / %012lld - %03d:%02d:%02d\r",
+		    (int)pnd, (int)(tot / runtime), (long long)tot,
+		    (int)(runtime / (60 * 60)),
+		    (int)((runtime / 60) % 60),
+		    (int)(runtime % 60));
+		fflush(stdout);
+
+		usleep(1000000);
+	}
+}
+
 
 static void
 usage(void)
@@ -151,9 +175,9 @@ int
 main(int argc, char **argv)
 {
 	struct devinfo *di;
+	pthread_t dummy;
 	int c;
 	int n = 0;
-	size_t total = 0;
 
 	pthread_mutex_init(&atomic_mtx, NULL);
 	pthread_cond_init(&atomic_cv, NULL);
@@ -186,7 +210,6 @@ main(int argc, char **argv)
 		usage();
 
 	TAILQ_FOREACH(di, &devinfo_head, entry) {
-		pthread_t dummy;
 
 		di->input_fd = open(di->inputfn, O_RDONLY);
 		if (di->input_fd == -1)
@@ -202,27 +225,30 @@ main(int argc, char **argv)
 
 	printf("Press CTRL+C to complete recording\n");
 
+	if (pthread_create(&dummy, NULL, &status_thread, NULL))
+		errx(EX_SOFTWARE, "Couldn't create thread");
+
 	atomic_lock();
 	while (1) {
 		struct data *ptr;
+
 		ptr = TAILQ_FIRST(&data_head);
 		if (ptr == NULL) {
 			atomic_wait();
 			continue;
 		}
 		TAILQ_REMOVE(&data_head, ptr, entry);
-		atomic_unlock();
-		if (write(ptr->fd, ptr->data, ptr->bytes) != ptr->bytes)
-			errx(EX_SOFTWARE, "Could not write data to file");
-
-		printf("Buffered bytes: %09d Total bytes: %012lld\r", pending, (long long)total);
-		fflush(stdout);
-		
-		atomic_lock();
 		total += ptr->bytes;
 		pending -= ptr->bytes;
+		atomic_unlock();
+
+		if (write(ptr->fd, ptr->data, ptr->bytes) != ptr->bytes)
+			err(EX_SOFTWARE, "Could not write data to file");
+
 		free(ptr);
+
+		atomic_lock();
 	}
-	atomic_unlock();	
+	atomic_unlock();
 	return (0);
 }
